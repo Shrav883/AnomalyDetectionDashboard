@@ -1,0 +1,19 @@
+# Node
+anomaly-frontend/node_modules/
+anomaly-frontend/dist/
+
+# Python
+anomaly_backend/venv/
+anomaly_backend/.venv/
+anomaly_backend/__pycache__/
+
+# Env / secrets
+.env
+*.env
+
+# Editor / OS
+.vscode/
+.idea/
+*.log
+.DS_Store
+Thumbs.db
