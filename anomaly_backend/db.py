@@ -1,19 +1,42 @@
-import os 
+import os
+from urllib.parse import quote_plus
+
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 from dotenv import load_dotenv
 
-#load .env file
+# Load .env file
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DB_SERVER = os.getenv("DB_SERVER")
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
 
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL not set in .env")
+if not all([DB_SERVER, DB_NAME, DB_USER, DB_PASSWORD]):
+    raise RuntimeError("Database config missing in .env (DB_SERVER, DB_NAME, DB_USER, DB_PASSWORD)")
 
-#global engine object
-engine = create_engine(DATABASE_URL, future=True)
+# Build ODBC connection string
+odbc_str = (
+    f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+    f"SERVER={DB_SERVER};"
+    f"DATABASE={DB_NAME};"
+    f"UID={DB_USER};"
+    f"PWD={DB_PASSWORD};"
+    "TrustServerCertificate=yes;"
+)
+
+# URL-encode and build final SQLAlchemy URL
+connection_url = f"mssql+pyodbc:///?odbc_connect={quote_plus(odbc_str)}"
+
+# Create engine
+engine = create_engine(connection_url, future=True)
 
 def test_connection():
-    """Running a simple query to verify DB Connectivity"""
-    with engine.connect() as conn:
-        return conn.execute(text("SELECT 1")).scalar_one()
+    """Simple DB health check."""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return True, None
+    except SQLAlchemyError as exc:
+        return False, str(exc)
