@@ -2,6 +2,8 @@
 import { useEffect, useState } from "react";
 import { fetchMlAlerts } from "../api/client";
 
+const MAX_ROWS = 1000;
+
 const severityClasses = {
   HIGH: "bg-red-100 text-red-700 border-red-300",
   MEDIUM: "bg-amber-100 text-amber-700 border-amber-300",
@@ -52,7 +54,7 @@ export default function Alerts() {
     };
   }, []);
 
-  const visibleAlerts = alerts
+  const filteredAlerts = alerts
     .filter((a) =>
       filteredSeverity === "ALL" ? true : a.severity === filteredSeverity
     )
@@ -65,9 +67,10 @@ export default function Alerts() {
       );
     });
 
+  const visibleAlerts = filteredAlerts.slice(0, MAX_ROWS);
+
   return (
     <div className="flex h-full bg-slate-50">
-      {/* If you have a sidebar, this page will be in the main content area */}
       <div className="flex-1 px-6 py-6">
         <header className="mb-6 flex items-center justify-between">
           <div>
@@ -140,6 +143,14 @@ export default function Alerts() {
             />
           </div>
         </div>
+
+        {/* Showing count summary */}
+      <div className="mb-2 text-xs text-slate-500">
+        Showing {visibleAlerts.length} of {filteredAlerts.length} alerts
+        {filteredAlerts.length > MAX_ROWS && (
+          <span className="text-slate-400"> (limited to {MAX_ROWS})</span>
+        )}
+      </div>
 
         {/* Content */}
         {loading && (
