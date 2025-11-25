@@ -2,6 +2,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from sqlalchemy import text
 from db import engine, test_connection
+from ml_model import detect_anomalies
 
 app = Flask (__name__)
 CORS(app) #frontend (react) to call this api
@@ -367,6 +368,29 @@ def get_failure_logs():
 
     data = [dict(r) for r in rows]
     return jsonify(data), 200
+
+
+
+def score_to_level(score: float) -> str:
+    HIGH_TH = -0.4
+    MED_TH = -0.2
+    if score <= HIGH_TH:
+        return "HIGH"
+    elif score <= MED_TH:
+        return "MEDIUM"
+    else:
+        return "LOW"
+
+
+@app.route("/api/ml-alerts", methods=["GET"])
+def ml_alerts():
+    try:
+        limit = int(request.args.get("limit", 50000))
+    except ValueError:
+        limit = 50000
+
+    alerts = detect_anomalies(limit=limit)
+    return jsonify(alerts)
 
 
 
