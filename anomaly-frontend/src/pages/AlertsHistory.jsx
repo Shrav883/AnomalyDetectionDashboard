@@ -55,19 +55,28 @@ export default function Alerts() {
   }, []);
 
   const filteredAlerts = alerts
-    .filter((a) =>
-      filteredSeverity === "ALL" ? true : a.severity === filteredSeverity
-    )
-    .filter((a) => {
-      if (!search.trim()) return true;
-      const q = search.toLowerCase();
-      return (
-        String(a.pumpName || "").toLowerCase().includes(q) ||
-        String(a.pumpId || "").toLowerCase().includes(q)
-      );
-    });
+  .filter((a) => {
+    if (filteredSeverity === "ALL") return true;
+    const sev = String(a.severity || "").toUpperCase();
+    return sev === filteredSeverity;
+  })
+  .filter((a) => {
+    if (!search.trim()) return true;
+    const q = search.toLowerCase();
+    return (
+      String(a.pumpName || "").toLowerCase().includes(q) ||
+      String(a.pumpId || "").toLowerCase().includes(q)
+    );
+  });
 
-  const visibleAlerts = filteredAlerts.slice(0, MAX_ROWS);
+const sortedAlerts = [...filteredAlerts].sort((a, b) => {
+  const ta = Date.parse(a.timestamp || "");
+  const tb = Date.parse(b.timestamp || "");
+  if (Number.isNaN(ta) || Number.isNaN(tb)) return 0;
+  return tb - ta; // newest first
+});
+
+const visibleAlerts = sortedAlerts.slice(0, MAX_ROWS);
 
   return (
     <div className="flex h-full bg-slate-50">
@@ -199,9 +208,8 @@ export default function Alerts() {
               </thead>
               <tbody className="divide-y divide-slate-100 text-sm">
                 {visibleAlerts.map((alert, idx) => {
-                  const sev = alert.severity || "LOW";
-                  const sevStyle =
-                    severityClasses[sev] || severityClasses.LOW;
+                  const sev = String(alert.severity || "LOW").toUpperCase();
+                  const sevStyle = severityClasses[sev] || severityClasses.LOW;
 
                   return (
                     <tr key={idx} className="hover:bg-slate-50/60">
