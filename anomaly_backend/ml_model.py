@@ -1,286 +1,353 @@
-import pandas as pd
-from joblib import load
-from sqlalchemy import text
+# anomaly_backend/ml_model.py
 import os
+import pandas as pd
+from sqlalchemy import text
+from joblib import load
 
 from db import engine
 
-# === Model ===
-BASE_DIR = os.path.dirname(__file__)  # folder where ml_model.py lives
-MODEL_PATH = os.path.join(BASE_DIR, "models", "isolation_forest_sitepro.joblib")
+# -----------------------
+# Load trained 21-feature bundle
+# -----------------------
+BASE_DIR = os.path.dirname(__file__)
+MODEL_PATH = os.path.join(
+    BASE_DIR,
+    "models",
+    "isolation_forest_sitepro_21features.joblib",
+)
 
-iso_model = load(MODEL_PATH)
+bundle = load(MODEL_PATH)
+MODEL_BY_PUMP = bundle["models"]      # dict: pump_id -> {"model", "scaler"}
+FEATURE_COLS = bundle["features"]     # list of 21 feature names
 
-# The features the Isolation Forest was trained on
-FEATURE_COLS = ["Frequency", "OutputCurrent", "OutputVoltage", "Pressure"]
+ALLOWED_PUMPS = [47366, 47367, 46962, 48142]  # Well 2, Well 1, Well 17, Injection
 
-# === Sensor mapping (from your notebook) ===
-SENSOR_TO_FEATURE = {
-    31487: "Pressure(psi)",
-    31488: "Flowrate(gal/min)",
-    31489: "Conductivity",
-    31538: "Flowrate(gal/min)",
-    40353: "Flowrate(gal/min)",
-    40355: "Frequency(Hz)",
-    42648: "Pressure(psi)",
+# FlowMeterID -> SitePumpID (from training notebook)
+FLOWMETER_TO_PUMP = {
+    4685: 46962,   # Well 17
+    5077: 47366,   # Well 2
+    5081: 47367,   # Well 1
+    5950: 48142,   # Injection
 }
-SENSOR_IDS = list(SENSOR_TO_FEATURE.keys())
 
-# Convenience: the exact column name we want for conductivity
-CONDUCTIVITY_COL = "Conductivity_31489"
+# SensorID -> feature name mapping (matches training)
+SENSOR_TO_FEATURE = {
+    31487: "Pressure(psi)_31487",
+    31488: "Flowrate(gal/min)_31488",
+    31489: "Conductivity_31489",
+    31538: "Flowrate(gal/min)_31538",
+    40353: "Flowrate(gal/min)_40353",
+    40355: "Frequency(Hz)_40355",
+    42648: "Pressure(psi)_42648",
+}
 
+# SensorID -> SitePumpID mapping (site_map1 from training)
+site_map1 = {
+    28284: 46962, 27464: 46962,
+    31486: 47366, 31535: 47367,
+    31488: 47366, 31538: 47367,
+    27430: 47367, 28283: 47367,
+    31487: 47366, 31536: 47367, 31537: 47367,
+    31489: 47366,
+    32406: 47366, 32407: 47367, 32416: 47367,
+    27883: 46962, 27915: 46962,
+    37662: 47366, 37669: 46962,
+    42648: 48142, 42649: 48142,
+    40353: 48142, 40355: 48142,
+    38676: 47366, 38681: 47367,
+    38730: 46962, 28279: 46962, 28280: 46962,
+    29145: 46962, 39324: 46962,
+    40352: 48142,
+    28281: 46962, 28282: 46962,
+}
 
-# --------------------------------------------------
-# 1) Pump logs
-# --------------------------------------------------
-def fetch_pump_logs(limit: int = 50000) -> pd.DataFrame:
-    """
-    Fetch recent PumpLogs rows for the pumps being monitored.
-    Only columns needed for the model + display.
-    """
-    query = f"""
+# -----------------------
+# Data fetch
+# -----------------------
+def fetch_recent_data(limit: int = 200_000):
+    """Grab PumpLogs + FlowMeterLogs + SensorLogs needed for features."""
+    pump_sql = f"""
         SELECT TOP ({limit})
             Frequency,
             OutputCurrent,
             OutputVoltage,
             Pressure,
+            IGBTTemperature,
             PumpLogDate,
             SitePumpID,
             Name
         FROM PumpLogs
         WHERE PumpLogDate >= '2025-01-01'
-        ORDER BY PumpLogDate DESC
+          AND SitePumpID IN (47366, 47367, 46962, 48142)
+        ORDER BY PumpLogDate ASC
     """
-    with engine.connect() as conn:
-        df = pd.read_sql_query(query, conn)
 
-    return df
-
-
-# --------------------------------------------------
-# 2) Sensor logs → pivoted feature columns
-# --------------------------------------------------
-def fetch_sensor_features() -> pd.DataFrame:
-    """
-    Fetch sensor time series for the sensor IDs in SENSOR_TO_FEATURE and
-    pivot them into feature columns like 'Conductivity_31489', etc.,
-    using LogDateTimeFixed.
-    """
-    id_list = ", ".join(str(sid) for sid in SENSOR_IDS)
-
-    q = text(f"""
+    sensor_sql = """
         SELECT
             SensorID,
+            SiteID,
             Value,
+            ValueUnits,
             DATEADD(year, 1600, LogDateTime) AS LogDateTimeFixed
         FROM SensorLogs
-        WHERE SensorID IN ({id_list})
-          AND DATEADD(year, 1600, LogDateTime) >= '2025-01-01'
-        ORDER BY LogDateTimeFixed
-    """)
+        WHERE DATEADD(year, 1600, LogDateTime) >= '2025-01-01'
+          AND SensorID IN (31487,31488,31489,31538,40353,40355,42648)
+    """
 
-    with engine.connect() as conn:
-        df = pd.read_sql_query(q, conn)
+    flow_sql = """
+        SELECT
+            FlowMeterID,
+            FlowRate,
+            LogStartTime
+        FROM FlowMeterLogs
+        WHERE LogStartTime >= '2025-01-01'
+          AND FlowMeterID IN (5950, 5077, 4685, 5081)
+        ORDER BY LogStartTime ASC
+    """
 
-    if df.empty:
-        return pd.DataFrame(columns=["SensorTime"])
+    with engine.begin() as conn:
+        pump_df = pd.read_sql(text(pump_sql), conn)
+        sensor_df = pd.read_sql(text(sensor_sql), conn)
+        flow_df = pd.read_sql(text(flow_sql), conn)
 
-    # Map each row to a feature label, e.g. "Conductivity_31489"
-    df["feature_name"] = df["SensorID"].map(SENSOR_TO_FEATURE)
-    df["feature_col"] = df["feature_name"] + "_" + df["SensorID"].astype(str)
+    return pump_df, sensor_df, flow_df
 
-    # Pivot: one row per timestamp, one column per feature_col
-    piv = (
-        df.pivot_table(
-            index="LogDateTimeFixed",
-            columns="feature_col",
-            values="Value",
-            aggfunc="last",
-        )
+# -----------------------
+# Feature engineering to match 21-feature training
+# -----------------------
+def build_features_21(limit: int = 200_000) -> pd.DataFrame:
+    """Rebuild the 21-feature table for the four pumps."""
+    pump_df, sensor_df, flow_df = fetch_recent_data(limit)
+
+    # ----- Pump side -----
+    pump_df["PumpLogDate"] = pd.to_datetime(pump_df["PumpLogDate"])
+    pump_df = pump_df.sort_values(["SitePumpID", "PumpLogDate"])
+
+    # Align PumpLogs to minute
+    pump_df["ts_minute"] = pump_df["PumpLogDate"].dt.floor("T")
+
+    # ----- FlowMeterLogs -> FlowRate -----
+    flow_df["LogStartTime"] = pd.to_datetime(flow_df["LogStartTime"])
+    flow_df["ts_minute"] = flow_df["LogStartTime"].dt.floor("T")
+    flow_df["SitePumpID"] = flow_df["FlowMeterID"].map(FLOWMETER_TO_PUMP)
+    flow_df = flow_df[flow_df["SitePumpID"].isin(ALLOWED_PUMPS)].copy()
+
+    flow_summary = (
+        flow_df
+        .groupby(["SitePumpID", "ts_minute"])["FlowRate"]
+        .mean()
         .reset_index()
-        .rename(columns={"LogDateTimeFixed": "SensorTime"})
     )
 
-    return piv
-
-
-def merge_pump_and_sensors(pump_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Time-align sensor features (like conductivity) with PumpLogs using nearest
-    timestamps. For now we mainly care about Conductivity_31489 for display.
-    """
-    sensor_df = fetch_sensor_features()
-
-    if sensor_df.empty:
-        # No sensor data; just return pump_df with a Conductivity column set to None
-        pump_df[CONDUCTIVITY_COL] = None
-        return pump_df
-
-    pump_sorted = pump_df.sort_values("PumpLogDate")
-    sensor_sorted = sensor_df.sort_values("SensorTime")
-
-    merged = pd.merge_asof(
-        pump_sorted,
-        sensor_sorted,
-        left_on="PumpLogDate",
-        right_on="SensorTime",
-        direction="nearest",
-        tolerance=pd.Timedelta("2min"),
+    # Merge FlowRate into pump_df
+    pump_df = pump_df.merge(
+        flow_summary,
+        how="left",
+        on=["SitePumpID", "ts_minute"],
     )
 
-    merged.drop(columns=["SensorTime"], inplace=True, errors="ignore")
+    # Fill gaps
+    pump_df = pump_df.ffill().bfill()
+    if "FlowRate" not in pump_df.columns:
+        pump_df["FlowRate"] = 0.0
+    pump_df["FlowRate"] = pump_df["FlowRate"].fillna(0.0)
 
-    # For convenience, also expose a simple 'Conductivity' alias if the column exists
-    if CONDUCTIVITY_COL in merged.columns:
-        merged["Conductivity"] = merged[CONDUCTIVITY_COL]
-    else:
-        merged["Conductivity"] = None
+    # Group per pump
+    g = pump_df.groupby("SitePumpID", group_keys=False)
+
+    # long-window baselines for deviations (≈2 hours)
+    baseline_pressure = g["Pressure"].transform(
+        lambda s: s.rolling(window=120, min_periods=30).mean()
+    )
+    baseline_current = g["OutputCurrent"].transform(
+        lambda s: s.rolling(window=120, min_periods=30).mean()
+    )
+
+    pump_df["pressure_dev"] = pump_df["Pressure"] - baseline_pressure
+    pump_df["current_dev"] = pump_df["OutputCurrent"] - baseline_current
+
+    pump_df["pressure_dev_pct"] = pump_df["pressure_dev"] / baseline_pressure.replace(0, pd.NA)
+    pump_df["current_dev_pct"] = pump_df["current_dev"] / baseline_current.replace(0, pd.NA)
+
+    # short rolling stats (window=5)
+    pump_df["Pressure_roll_mean_5"] = g["Pressure"].transform(
+        lambda s: s.rolling(window=5, min_periods=1).mean()
+    )
+    pump_df["Pressure_roll_std_5"] = g["Pressure"].transform(
+        lambda s: s.rolling(window=5, min_periods=1).std().fillna(0)
+    )
+    pump_df["OutputCurrent_roll_mean_5"] = g["OutputCurrent"].transform(
+        lambda s: s.rolling(window=5, min_periods=1).mean()
+    )
+    pump_df["OutputCurrent_roll_std_5"] = g["OutputCurrent"].transform(
+        lambda s: s.rolling(window=5, min_periods=1).std().fillna(0)
+    )
+    pump_df["FlowRate_roll_mean_5"] = g["FlowRate"].transform(
+        lambda s: s.rolling(window=5, min_periods=1).mean()
+    )
+    pump_df["FlowRate_roll_std_5"] = g["FlowRate"].transform(
+        lambda s: s.rolling(window=5, min_periods=1).std().fillna(0)
+    )
+
+    # ----- Sensor side -----
+    sensor_df["SitePumpID"] = sensor_df["SensorID"].map(site_map1)
+    sensor_df = sensor_df[sensor_df["SitePumpID"].isin(ALLOWED_PUMPS)].copy()
+    sensor_df["LogDateTimeFixed"] = pd.to_datetime(sensor_df["LogDateTimeFixed"])
+    sensor_df["ts_minute"] = sensor_df["LogDateTimeFixed"].dt.floor("T")
+
+    sensor_pivot = (
+        sensor_df
+        .pivot_table(
+            index=["SitePumpID", "ts_minute"],
+            columns="SensorID",
+            values="Value",
+            aggfunc="mean",
+        )
+        .rename(columns=SENSOR_TO_FEATURE)
+        .reset_index()
+    )
+
+    merged = pump_df.merge(
+        sensor_pivot,
+        how="left",
+        on=["SitePumpID", "ts_minute"],
+    )
+
+    # make sure all training features exist
+    for col in FEATURE_COLS:
+        if col not in merged.columns:
+            merged[col] = 0.0
+
+    merged = merged.ffill().bfill().fillna(0)
 
     return merged
 
-
-# --------------------------------------------------
-# 3) Main entry: detect anomalies
-# --------------------------------------------------
-
-EXPLANATION_FEATURES = ["Frequency", "OutputCurrent", "OutputVoltage", "Pressure"]
-
-def build_feature_stats(df):
+# -----------------------
+# Main entry used by Flask
+# -----------------------
+def detect_anomalies(limit: int = 200_000):
     """
-    Compute mean and std for each feature, used to generate explanations.
+    Build 21-feature table, run per-pump models, and return a list of anomalies.
     """
-    stats = {}
-    for col in EXPLANATION_FEATURES:
-        if col in df.columns:
-            mean = df[col].mean()
-            std = df[col].std()
-            if std == 0 or pd.isna(std):
-                std = 1.0  # avoid division by zero
-            stats[col] = {"mean": mean, "std": std}
-    return stats
+    df = build_features_21(limit=limit)
+
+    all_rows = []
+
+    # run each pump through its own model
+    for pump_id, group in df.groupby("SitePumpID"):
+        model_pack = MODEL_BY_PUMP.get(int(pump_id))
+        if model_pack is None:
+            continue
+
+        scaler = model_pack["scaler"]
+        model = model_pack["model"]
+
+        X = group[FEATURE_COLS].astype(float)
+        X_scaled = scaler.transform(X)
+
+        preds = model.predict(X_scaled)                  # 1 normal, -1 anomaly
+        scores = model.decision_function(X_scaled)       # lower = more anomalous
+
+        g2 = group.copy()
+        g2["pred"] = preds
+        g2["anom_score"] = scores
+        all_rows.append(g2)
+
+        if not all_rows:
+            return []
+
+        merged = pd.concat(all_rows, ignore_index=True)
+
+        # keep anomalies only
+        anomalies = merged[merged["pred"] == -1].copy()
+        if anomalies.empty:
+            return []
+
+        # --- sort anomalies: newest first, then most anomalous (lowest score) ---
+        anomalies = anomalies.sort_values(
+            ["PumpLogDate", "anom_score"],
+            ascending=[False, True],  # newer date first, lower score first
+        )
+
+        # severity based on anomaly scores (computed from anomalies only)
+        q_low = anomalies["anom_score"].quantile(0.10)   # bottom 10% = HIGH
+        q_med = anomalies["anom_score"].quantile(0.25)   # bottom 25% = MEDIUM
+
+        def map_severity(s: float) -> str:
+            if s <= q_low:
+                return "HIGH"
+            elif s <= q_med:
+                return "MEDIUM"
+            else:
+                return "LOW"
+
+        anomalies["severity"] = anomalies["anom_score"].apply(map_severity)
 
 
-def explain_row(row, stats):
-    """
-    Find the feature with largest z-score and generate a short text reason.
-    """
-    deviations = []
+    # precompute a conductivity baseline (if present) using all data
+    cond_baseline = None
+    if "Conductivity_31489" in merged.columns:
+        cond_baseline = merged["Conductivity_31489"].median()
 
-    for col in EXPLANATION_FEATURES:
-        if col in stats and col in row:
-            mean = stats[col]["mean"]
-            std = stats[col]["std"]
-            z = (row[col] - mean) / std
-            deviations.append((col, z))
+    def build_reason(row):
+        reasons = []
 
-    if not deviations:
-        return "Anomalous behavior detected across pump signals."
+        # Pressure vs long-term baseline
+        pdp = row.get("pressure_dev_pct", None)
+        if pdp is not None and pdp == pdp:  # not NaN
+            if pdp > 0.35:
+                reasons.append("Pressure significantly higher than typical baseline.")
+            elif pdp < -0.35:
+                reasons.append("Pressure significantly lower than typical baseline.")
 
-    # pick feature with largest absolute z-score
-    col, z = max(deviations, key=lambda x: abs(x[1]))
-    direction = "high" if z > 0 else "low"
+        # Current vs long-term baseline
+        cdp = row.get("current_dev_pct", None)
+        if cdp is not None and cdp == cdp:
+            if cdp > 0.35:
+                reasons.append("Current draw higher than expected for this pump.")
+            elif cdp < -0.35:
+                reasons.append("Current draw lower than expected for this pump.")
 
-    if col == "Frequency":
-        if direction == "high":
-            return "Frequency is significantly higher than typical values."
-        else:
-            return "Frequency dropped lower than usual or towards zero."
+        # Flow rate vs short-term behavior
+        fr = row.get("FlowRate", None)
+        fr_mean5 = row.get("FlowRate_roll_mean_5", None)
+        if fr is not None and fr_mean5 is not None and fr_mean5 not in (0, float("inf")):
+            try:
+                if fr < 0.7 * fr_mean5:
+                    reasons.append("Flow rate has dropped compared to recent history.")
+                elif fr > 1.3 * fr_mean5:
+                    reasons.append("Flow rate is spiking compared to recent history.")
+            except TypeError:
+                pass
 
-    if col == "OutputCurrent":
-        if direction == "high":
-            return "Output current is unusually high compared to normal operation."
-        else:
-            return "Output current is unusually low, indicating possible pump stall or no-load."
+        # High conductivity compared to typical
+        if cond_baseline is not None:
+            cond = row.get("Conductivity_31489", None)
+            if cond is not None and cond == cond and cond_baseline > 0:
+                if cond > 1.3 * cond_baseline:
+                    reasons.append("Conductivity higher than typical for this pump.")
 
-    if col == "OutputVoltage":
-        if direction == "high":
-            return "Output voltage spikes above its normal range."
-        else:
-            return "Output voltage is lower than typical operating levels."
+        if not reasons:
+            return "Model flagged this point as anomalous based on combined sensor patterns."
+        return " ".join(reasons)
 
-    if col == "Pressure":
-        if direction == "high":
-            return "Discharge pressure is higher than normal, suggesting possible blockage or restriction."
-        else:
-            return "Discharge pressure is lower than normal, suggesting leak, cavitation, or no-flow condition."
-
-    return "Anomalous behavior detected across pump signals."
-
-
-def detect_anomalies(limit: int = 50000):
-    """
-    Run Isolation Forest on recent PumpLogs and return a list of
-    anomalies with severity and textual explanations.
-    """
-    pump_df = fetch_pump_logs(limit=limit)
-    if pump_df.empty:
-        return []
-
-    # If you have conductivity merged in, call that here instead:
-    # df = merge_pump_and_sensors(pump_df)
-    df = pump_df.copy()
-
-    # Clean & sort
-    df = df.sort_values("PumpLogDate")
-    df = df.ffill().bfill().fillna(0)
-
-    # Features for the model
-    missing = [c for c in FEATURE_COLS if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing features for model: {missing}")
-
-    X = df[FEATURE_COLS].astype(float)
-
-    # Model inference
-    preds = iso_model.predict(X)            # -1 = anomaly, 1 = normal
-    scores = iso_model.decision_function(X)
-
-    df["anom_flag"] = (preds == -1).astype(int)
-    df["anom_score"] = scores
-
-    # --- severity using quantiles over ALL rows ---
-    q_low = df["anom_score"].quantile(0.10)   # bottom 10% -> HIGH
-    q_med = df["anom_score"].quantile(0.25)   # bottom 25% -> MEDIUM
-
-    def map_severity(score):
-        if score <= q_low:
-            return "HIGH"
-        elif score <= q_med:
-            return "MEDIUM"
-        else:
-            return "LOW"
-
-    df["severity"] = df["anom_score"].apply(map_severity)
-
-    # Only keep medium / high for the alerts feed
-    alerts_df = df.copy()
-
-    # Build stats for explanation
-    stats = build_feature_stats(df)
-
-    # Newest first
-    alerts_df = alerts_df.sort_values("PumpLogDate", ascending=False)
-
-    # Convert to list[dict] with explanation
-    records = []
-    for _, row in alerts_df.iterrows():
-        reason = explain_row(row, stats)
-
-        records.append({
+    # --- Build final payload ---
+    results = []
+    for _, row in anomalies.iterrows():
+        results.append({
             "pumpId": int(row["SitePumpID"]),
-            "pumpName": row.get("Name"),
-            "timestamp": row["PumpLogDate"],
+            "pumpName": row.get("Name", "Unknown Pump"),
+            "timestamp": row["PumpLogDate"].isoformat(),
+
             "frequency": float(row["Frequency"]),
-            "current": float(row["OutputCurrent"]),
             "voltage": float(row["OutputVoltage"]),
+            "current": float(row["OutputCurrent"]),
             "pressure": float(row["Pressure"]),
-            # if you have Conductivity column merged in:
-            "conductivity": float(row["Conductivity"]) if "Conductivity" in row and pd.notna(row["Conductivity"]) else None,
+            "conductivity": float(row.get("Conductivity_31489", 0.0)),
+
             "score": float(row["anom_score"]),
             "severity": row["severity"],
-            "reason": reason,
+            "reason": build_reason(row),
         })
 
-    return records
-
-
+    return results

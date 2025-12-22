@@ -1,47 +1,51 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from sqlalchemy import text
+
 from db import engine, test_connection
 from ml_model import detect_anomalies
 
-app = Flask (__name__)
-CORS(app) #frontend (react) to call this api
+app = Flask(__name__)
+CORS(app)  # allow React frontend to call this API
 
-# Dummy dashboard credentials
+# Dummy dashboard credentials (for login page)
 APP_USERNAME = "student"   # change if you want
 APP_PASSWORD = "demo123"   # change if you want
 DUMMY_TOKEN = "demo-token-123"
 
 
-#check db connection
+# -----------------------
+# Health / sanity endpoints
+# -----------------------
 @app.route("/api/health", methods=["GET"])
 def health():
     """
-    check flask app is running and db connection works
-    
+    Check that Flask is running and DB connection works.
     """
     try:
         db_status = test_connection()
         return jsonify({"status": "ok", "db": db_status}), 200
     except Exception as e:
-        return jsonify({"status": "error", "message": str (e)}), 500
-  
-  
-#runs simple query  
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @app.route("/api/sample", methods=["GET"])
 def sample():
     """
-    Simple test endpoint to show how to run a SQL query
-    right now it just runs select 1
+    Simple test endpoint to show how to run a SQL query.
+    Right now it just runs: SELECT 1 AS test_value
     """
     sql = text("SELECT 1 AS test_value")
     with engine.connect() as conn:
-        rows = conn.execute(sql).mapping().all()
-        
+        rows = conn.execute(sql).mappings().all()
+
     data = [dict(r) for r in rows]
     return jsonify(data), 200
 
-#login route
+
+# -----------------------
+# Dummy login (for dashboard)
+# -----------------------
 @app.route("/api/login", methods=["GET", "POST", "OPTIONS"])
 def login():
     """
@@ -79,7 +83,9 @@ def login():
     return jsonify({"message": "Invalid username or password"}), 401
 
 
-#flowmeterlogs data
+# -----------------------
+# Flow meter logs
+# -----------------------
 @app.route("/api/flowmeter", methods=["GET"])
 def get_flowmeter_logs():
     """
@@ -87,7 +93,8 @@ def get_flowmeter_logs():
     between January 1, 2025 and January 1, 2026.
     """
     sql = text("""
-        SELECT FlowMeterID, SitePipelineID, TotalVolume, DayVolume, FlowRate, LogStartTime, LogEndTime
+        SELECT FlowMeterID, SitePipelineID, TotalVolume, DayVolume,
+               FlowRate, LogStartTime, LogEndTime
         FROM FlowMeterLogs
         WHERE LogStartTime >= :start_2025
           AND LogStartTime <  :end_2026
@@ -97,7 +104,7 @@ def get_flowmeter_logs():
 
     params = {
         "start_2025": "2025-01-01",
-        "end_2026": "2026-01-01"
+        "end_2026": "2026-01-01",
     }
 
     with engine.connect() as conn:
@@ -106,7 +113,10 @@ def get_flowmeter_logs():
     data = [dict(r) for r in rows]
     return jsonify(data), 200
 
-#all pumps data
+
+# -----------------------
+# Pump cards (overview)
+# -----------------------
 @app.route("/api/pumps", methods=["GET"])
 def get_pumps():
     """
@@ -167,7 +177,6 @@ def get_pumps():
         with engine.connect() as conn:
             rows = conn.execute(sql, params).mappings().all()
     except Exception as e:
-        # helpful error if SQL is still angry
         return jsonify({"status": "error", "message": str(e)}), 500
 
     pumps = []
@@ -185,12 +194,15 @@ def get_pumps():
             "statusId": r["StatusID"],
             "alertStatus": alert_status,
             "running": bool(running),
-            "lastLogTime": r["PumpLogDate"].isoformat()
+            "lastLogTime": r["PumpLogDate"].isoformat(),
         })
 
     return jsonify(pumps), 200
 
-#each pump data
+
+# -----------------------
+# Single pump details
+# -----------------------
 @app.route("/api/pumps/<int:site_pump_id>", methods=["GET"])
 def get_pump_details(site_pump_id):
     """
@@ -199,7 +211,6 @@ def get_pump_details(site_pump_id):
       - recent history (for trends/charts)
     """
 
-    # You can let the frontend override this later with ?limit=
     limit = int(request.args.get("limit", 200))
 
     # 1) Latest log row for this pump
@@ -291,10 +302,13 @@ def get_pump_details(site_pump_id):
 
     return jsonify({
         "pump": pump,
-        "history": history
+        "history": history,
     }), 200
 
-#failures list
+
+# -----------------------
+# Failure logs list
+# -----------------------
 @app.route("/api/failures", methods=["GET"])
 def get_failure_logs():
     """
@@ -370,29 +384,21 @@ def get_failure_logs():
     return jsonify(data), 200
 
 
-
-def score_to_level(score: float) -> str:
-    HIGH_TH = -0.4
-    MED_TH = -0.2
-    if score <= HIGH_TH:
-        return "HIGH"
-    elif score <= MED_TH:
-        return "MEDIUM"
-    else:
-        return "LOW"
-
-
+# -----------------------
+# ML alerts (21-feature model)
+# -----------------------
 @app.route("/api/ml-alerts", methods=["GET"])
 def ml_alerts():
+    """
+    Returns ML-based anomaly alerts from the 21-feature Isolation Forest model.
+    Optional: ?limit=50000
+    """
+    limit = request.args.get("limit", default=50000, type=int)
     try:
-        limit = int(request.args.get("limit", 50000))
-    except ValueError:
-        limit = 50000
-
-    alerts = detect_anomalies(limit=limit)
-    return jsonify(alerts)
-
-
+        alerts = detect_anomalies(limit=limit)
+        return jsonify(alerts), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 if __name__ == "__main__":
